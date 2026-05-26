@@ -2,7 +2,7 @@
 # OCR API 启动脚本
 
 # 设置工作目录
-cd ~/.openclaw/workspace
+# cd ~/.openclaw/workspace
 
 # 激活虚拟环境
 source ocr_env/bin/activate
