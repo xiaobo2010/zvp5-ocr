@@ -6,10 +6,10 @@ OCR API Server using pytesseract + FastAPI
 
 import os
 import io
-import tempfile
 import time
+import signal
 from typing import Optional, Dict, Any
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import pytesseract
@@ -52,23 +52,60 @@ class OCRProcessor:
     def __init__(self):
         self.config = OCRConfig()
         
+    def _ocr_with_timeout(self, image: Image.Image, lang: str, timeout: int):
+        """带超时控制的OCR处理，防止大图卡死worker"""
+        result_holder: Dict[str, Any] = {"result": None, "error": None}
+
+        def _worker():
+            try:
+                text = pytesseract.image_to_string(image, lang=lang)
+                data = pytesseract.image_to_data(image, lang=lang, output_type=pytesseract.Output.DICT)
+                result_holder["result"] = (text, data)
+            except Exception as ex:
+                result_holder["error"] = ex
+
+        # 在子进程中执行OCR，利用SIGALRM实现超时
+        import threading
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        thread.join(timeout=timeout)
+
+        if thread.is_alive():
+            # 超时，线程仍在运行（但因daemon=True不会阻止进程退出）
+            return None, TimeoutError(f"OCR处理超时（>{timeout}秒），图片可能过大或过于复杂")
+
+        if result_holder["error"] is not None:
+            return None, result_holder["error"]
+
+        return result_holder["result"], None
+
     def extract_text(self, image: Image.Image, lang: str = 'chi_sim+eng') -> Dict[str, Any]:
         """从图片中提取文字"""
         try:
             start_time = time.time()
-            
-            # OCR识别
-            text = pytesseract.image_to_string(image, lang=lang)
-            
-            # 获取详细OCR信息
-            data = pytesseract.image_to_data(image, lang=lang, output_type=pytesseract.Output.DICT)
-            
+
+            # 带超时的OCR处理
+            ocr_result, error = self._ocr_with_timeout(image, lang, self.config.timeout)
+            if error is not None:
+                raise error
+
+            text, data = ocr_result
+
             # 统计信息
             processing_time = time.time() - start_time
             word_count = len(text.split())
-            confidence_scores = [int(conf) for conf in data['conf'] if int(conf) > 0]
+
+            # 安全转换置信度值，防止非数字值导致崩溃
+            confidence_scores = []
+            for conf in data['conf']:
+                try:
+                    val = int(conf)
+                    if val > 0:
+                        confidence_scores.append(val)
+                except (ValueError, TypeError):
+                    continue
             avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0
-            
+
             return {
                 "success": True,
                 "text": text.strip(),
@@ -80,7 +117,7 @@ class OCRProcessor:
                     "words_with_confidence": [
                         {
                             "text": data['text'][i],
-                            "confidence": int(data['conf'][i]),
+                            "confidence": confidence_scores[j] if j < len(confidence_scores) else 0,
                             "bbox": {
                                 "x": data['left'][i],
                                 "y": data['top'][i],
@@ -88,12 +125,21 @@ class OCRProcessor:
                                 "height": data['height'][i]
                             }
                         }
-                        for i in range(len(data['text']))
-                        if int(data['conf'][i]) > 0
+                        for j, i in enumerate(
+                            idx for idx in range(len(data['text']))
+                            if _safe_int(data['conf'][idx], 0) > 0
+                        )
                     ]
                 }
             }
-            
+
+        except TimeoutError as e:
+            logger.error(f"OCR处理超时: {str(e)}")
+            return {
+                "success": False,
+                "error": "TIMEOUT",
+                "message": str(e)
+            }
         except Exception as e:
             logger.error(f"OCR处理失败: {str(e)}")
             return {
@@ -101,6 +147,13 @@ class OCRProcessor:
                 "error": str(e),
                 "message": "OCR处理过程中发生错误"
             }
+
+def _safe_int(value, default=0) -> int:
+    """安全地将值转换为int，失败时返回默认值"""
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
 
 # 全局OCR处理器
 ocr_processor = OCRProcessor()
@@ -177,8 +230,8 @@ async def upload_and_ocr(
         # 读取图片
         image = Image.open(io.BytesIO(contents))
         
-        # 转换为RGB模式（如果是RGBA）
-        if image.mode in ('RGBA', 'LA', 'P'):
+        # 转换为兼容模式
+        if image.mode not in ('RGB', 'L'):
             image = image.convert('RGB')
         
         # OCR处理
@@ -231,10 +284,23 @@ async def batch_upload_and_ocr(
                 })
                 continue
             
-            # 读取图片
+            # 验证文件大小
             contents = await file.read()
+            if len(contents) > ocr_processor.config.max_file_size:
+                results.append({
+                    "filename": file.filename,
+                    "success": False,
+                    "error": f"文件过大，最大支持{ocr_processor.config.max_file_size / 1024 / 1024:.0f}MB"
+                })
+                continue
+
+            # 读取图片
             image = Image.open(io.BytesIO(contents))
-            
+
+            # 转换为兼容模式
+            if image.mode not in ('RGB', 'L'):
+                image = image.convert('RGB')
+
             # OCR处理
             result = ocr_processor.extract_text(image, language)
             result["filename"] = file.filename
